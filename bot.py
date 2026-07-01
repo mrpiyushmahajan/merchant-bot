@@ -491,10 +491,10 @@ WELCOME = (
     "I compile *GPay Business* and *Paytm* merchant CSVs from multiple shops "
     "into a single, colour-coded Excel report.\n\n"
     "📤 *How to use*\n"
-    "1. Send me your CSV files one by one (or in batches)\n"
-    "2. For GPay files I'll ask for the shop name — just reply with the name\n"
-    "3. For Paytm files the shop name is read automatically\n"
-    "4. When you're done sending files, use /compile\n\n"
+    "1. Send all your CSV files at once (select multiple & send together)\n"
+    "2. Paytm CSVs are processed instantly — shop name is read automatically\n"
+    "3. For GPay CSVs I'll ask the shop name for each one\n"
+    "4. When done, use /compile to get the Excel report\n\n"
     "📋 *Commands*\n"
     "/status   — See what's collected so far\n"
     "/compile  — Generate & download the Excel report\n"
@@ -504,8 +504,36 @@ WELCOME = (
 
 
 def _ensure_state(context: ContextTypes.DEFAULT_TYPE) -> None:
-    context.user_data.setdefault("records",     [])
-    context.user_data.setdefault("pending_csv", None)   # (type, df, filename)
+    context.user_data.setdefault("records",          [])
+    context.user_data.setdefault("pending_csv",      None)   # legacy – kept for compat
+    context.user_data.setdefault("gpay_queue",       [])     # list of (df, filename)
+    context.user_data.setdefault("asking_gpay_name", False)
+
+
+async def _prompt_next_gpay(update: Update,
+                             context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Ask the user for the shop name of the next queued GPay CSV."""
+    queue = context.user_data["gpay_queue"]
+    if not queue:
+        context.user_data["asking_gpay_name"] = False
+        remaining = len(context.user_data["records"])
+        await update.message.reply_text(
+            f"✅ All files processed!  {remaining} transaction(s) collected.\n"
+            "Use /compile to generate the Excel report.",
+            parse_mode="Markdown",
+        )
+        return
+
+    _, filename = queue[0]
+    context.user_data["asking_gpay_name"] = True
+    count = len(queue)
+    await update.message.reply_text(
+        f"📗 *GPay CSV:* `{filename}`\n"
+        f"{'(' + str(count) + ' GPay file(s) left to name)  ' if count > 1 else ''}"
+        f"What is the *shop name* for this file?\n"
+        "_(Just type the name and send)_",
+        parse_mode="Markdown",
+    )
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -548,10 +576,11 @@ async def cmd_compile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     _ensure_state(context)
     records = context.user_data["records"]
 
-    if context.user_data["pending_csv"]:
+    if context.user_data["gpay_queue"]:
+        remaining = len(context.user_data["gpay_queue"])
         await update.message.reply_text(
-            "⚠️ You have a GPay CSV waiting for a shop name.\n"
-            "Reply with the shop name first, then use /compile."
+            f"⚠️ {remaining} GPay CSV(s) still need a shop name.\n"
+            "Reply with the shop name to continue, then use /compile."
         )
         return
 
@@ -593,8 +622,10 @@ async def cmd_compile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    context.user_data["records"]     = []
-    context.user_data["pending_csv"] = None
+    context.user_data["records"]          = []
+    context.user_data["pending_csv"]      = None
+    context.user_data["gpay_queue"]       = []
+    context.user_data["asking_gpay_name"] = False
     await update.message.reply_text(
         "🔄 All data cleared!  Send fresh CSVs whenever you're ready."
     )
@@ -612,20 +643,7 @@ async def handle_document(update: Update,
         )
         return
 
-    # If another GPay CSV is waiting for a name, warn and bail
-    if context.user_data["pending_csv"] is not None:
-        await update.message.reply_text(
-            "⚠️ I'm still waiting for the shop name of the previous GPay CSV.\n"
-            "Please reply with the shop name before sending the next file."
-        )
-        return
-
-    progress = await update.message.reply_text(
-        f"📥 Received `{doc.file_name}`, detecting format…",
-        parse_mode="Markdown",
-    )
-
-    # Download
+    # Download & detect
     tg_file = await doc.get_file()
     bio     = io.BytesIO()
     await tg_file.download_to_memory(bio)
@@ -634,48 +652,49 @@ async def handle_document(update: Update,
     try:
         df = pd.read_csv(bio)
     except Exception as exc:
-        await progress.edit_text(f"❌ Could not read CSV: `{exc}`",
-                                  parse_mode="Markdown")
+        await update.message.reply_text(
+            f"❌ Could not read `{doc.file_name}`: `{exc}`",
+            parse_mode="Markdown",
+        )
         return
 
     csv_type = detect_csv_type(df)
 
     if csv_type == "gpay":
-        context.user_data["pending_csv"] = ("gpay", df, doc.file_name)
-        await progress.edit_text(
-            f"📗 Detected: *GPay Business CSV*  (`{doc.file_name}`)\n\n"
-            "What is the *shop / merchant name* for this file?\n"
-            "_(Just type the name and send)_",
+        # Queue the GPay CSV; will ask for name after any in-progress name entry
+        context.user_data["gpay_queue"].append((df, doc.file_name))
+        await update.message.reply_text(
+            f"📗 *GPay CSV queued:* `{doc.file_name}`",
             parse_mode="Markdown",
         )
+        # Start asking for names if not already doing so
+        if not context.user_data["asking_gpay_name"]:
+            await _prompt_next_gpay(update, context)
 
     elif csv_type == "paytm":
         records = parse_paytm_csv(df)
         if not records:
-            await progress.edit_text(
-                "⚠️ No `SUCCESS` transactions found in this Paytm CSV.\n"
+            await update.message.reply_text(
+                f"⚠️ No `SUCCESS` transactions found in `{doc.file_name}`.\n"
                 "Make sure you're using the correct merchant export."
             )
             return
 
         context.user_data["records"].extend(records)
-        shops   = sorted({r["shop"] for r in records})
-        total   = sum(r["amount"] for r in records)
-        await progress.edit_text(
-            f"✅ *Paytm CSV processed!*\n"
+        shops = sorted({r["shop"] for r in records})
+        total = sum(r["amount"] for r in records)
+        await update.message.reply_text(
+            f"✅ *Paytm CSV processed:* `{doc.file_name}`\n"
             f"🏪 Shop(s): `{'`, `'.join(shops)}`\n"
-            f"📊 Transactions: {len(records)}\n"
-            f"💰 Total: ₹{total:,.2f}\n\n"
-            "Send more CSVs or use /compile.",
+            f"📊 Transactions: {len(records)}  •  💰 ₹{total:,.2f}",
             parse_mode="Markdown",
         )
 
     else:
-        await progress.edit_text(
-            "❓ Couldn't identify this as a GPay or Paytm export.\n\n"
-            "*GPay export* should have columns like `Creation time`, `Paid via`.\n"
-            "*Paytm export* should have `Transaction_Date`, `Merchant_Name`.\n\n"
-            "Please check the file and try again.",
+        await update.message.reply_text(
+            f"❓ `{doc.file_name}` — couldn't identify as GPay or Paytm.\n\n"
+            "*GPay export* columns: `Creation time`, `Paid via`\n"
+            "*Paytm export* columns: `Transaction_Date`, `Merchant_Name`",
             parse_mode="Markdown",
         )
 
@@ -683,46 +702,43 @@ async def handle_document(update: Update,
 async def handle_text(update: Update,
                       context: ContextTypes.DEFAULT_TYPE) -> None:
     _ensure_state(context)
-    pending = context.user_data.get("pending_csv")
 
-    if pending is None:
-        # Not waiting for a shop name — show generic help
+    if not context.user_data["asking_gpay_name"]:
         await update.message.reply_text(
-            "Send me a CSV file, or use /start to see all commands."
+            "Send me CSV files, or use /start to see all commands."
         )
         return
 
-    csv_type, df, filename = pending
     shop_name = update.message.text.strip()
-
     if not shop_name:
-        await update.message.reply_text(
-            "Please enter a valid shop name (can't be empty)."
-        )
+        await update.message.reply_text("Please enter a valid shop name (can't be empty).")
         return
 
-    if csv_type == "gpay":
-        records = parse_gpay_csv(df, shop_name)
-        context.user_data["records"].extend(records)
-        context.user_data["pending_csv"] = None
+    queue = context.user_data["gpay_queue"]
+    if not queue:
+        context.user_data["asking_gpay_name"] = False
+        return
 
-        if not records:
-            await update.message.reply_text(
-                f"⚠️ No valid UPI transactions found in that GPay CSV for *{shop_name}*.\n"
-                "Only Settled UPI payments with positive amounts are counted.",
-                parse_mode="Markdown",
-            )
-            return
+    # Process the first item in the queue
+    df, filename = queue.pop(0)
+    records = parse_gpay_csv(df, shop_name)
+    context.user_data["records"].extend(records)
 
+    if records:
         total = sum(r["amount"] for r in records)
         await update.message.reply_text(
-            f"✅ *GPay CSV processed!*\n"
-            f"🏪 Shop: `{shop_name}`\n"
-            f"📊 Transactions: {len(records)}\n"
-            f"💰 Total: ₹{total:,.2f}\n\n"
-            "Send more CSVs or use /compile.",
+            f"✅ *GPay processed:* `{filename}`\n"
+            f"🏪 Shop: `{shop_name}`  •  📊 {len(records)} txns  •  💰 ₹{total:,.2f}",
             parse_mode="Markdown",
         )
+    else:
+        await update.message.reply_text(
+            f"⚠️ No valid UPI transactions found in `{filename}` for *{shop_name}*.",
+            parse_mode="Markdown",
+        )
+
+    # Ask for next GPay file's name, or finish
+    await _prompt_next_gpay(update, context)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
