@@ -1,0 +1,33 @@
+# Environment variables — NEVER commit this
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+
+# Bot session data
+*.session
+*.session-journal
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Logs
+*.log
+
+# Sample output (not needed in repo)
+Sample_Report.xlsx
