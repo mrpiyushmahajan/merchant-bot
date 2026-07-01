@@ -53,6 +53,24 @@ def _clean(val: str) -> str:
     return str(val).strip().strip("'\"")
 
 
+def _find_col(df: pd.DataFrame, *candidates: str):
+    """
+    Return the actual DataFrame column name that best matches any candidate.
+    Tries exact match (case-insensitive) first, then prefix match.
+    Returns None if nothing found.
+    """
+    cols_lower = {c.strip().lower(): c.strip() for c in df.columns}
+    for cand in candidates:
+        cand_l = cand.lower()
+        if cand_l in cols_lower:
+            return cols_lower[cand_l]
+        # prefix match — e.g. "type" matches "Type (UPI / UPI CC)"
+        for orig_l, orig in cols_lower.items():
+            if orig_l.startswith(cand_l):
+                return orig
+    return None
+
+
 def detect_csv_type(df: pd.DataFrame) -> str:
     """Return 'gpay', 'paytm', or 'unknown' based on column signatures."""
     cols = {c.strip().lower() for c in df.columns}
@@ -65,37 +83,59 @@ def detect_csv_type(df: pd.DataFrame) -> str:
 
 def parse_gpay_csv(df: pd.DataFrame, shop_name: str) -> list[dict]:
     """
-    GPay Business export columns we care about:
-        Creation time | Type | Amount | Status
+    GPay Business export — works with both old and new column layouts:
+
+    Old layout : Type | Payer/Receiver | Creation time | Status | Amount
+    New layout : Type (UPI / UPI CC) | Payer | Creation time | Status | Amount
 
     Rules:
-    • Status  == 'Settled'
-    • Type    == 'UPI'        (skip 'Daily collections' = SoundPod fee)
-    • Amount  >  0            (skip fee deductions which are negative)
+    • Type    starts with 'UPI'          (filters out SoundPod / Daily collection rows)
+    • Status  is 'Settled' OR 'Scheduled to Settle'  (today's txns haven't settled yet)
+    • Amount  > 0                         (skip negative fee deductions)
     """
     df = df.copy()
     df.columns = [c.strip() for c in df.columns]
 
-    df["Amount"] = pd.to_numeric(df["Amount"], errors="coerce")
+    # Locate columns flexibly
+    type_col   = _find_col(df, "type")           # "Type" or "Type (UPI / UPI CC)"
+    status_col = _find_col(df, "status")
+    amount_col = _find_col(df, "amount")
+    time_col   = _find_col(df, "creation time")
+    payer_col  = _find_col(df, "payer/receiver", "payer")
+    txn_col    = _find_col(df, "transaction id")
+
+    if not all([type_col, status_col, amount_col, time_col]):
+        logger.warning(
+            "GPay CSV missing expected columns. Found: %s", list(df.columns)
+        )
+        return []
+
+    df[amount_col] = pd.to_numeric(df[amount_col], errors="coerce")
+
+    status_lower = df[status_col].str.strip().str.lower()
+    type_upper   = df[type_col].str.strip().str.upper()
+
     mask = (
-        (df["Status"].str.strip() == "Settled")
-        & (df["Type"].str.strip() == "UPI")
-        & (df["Amount"] > 0)
+        (status_lower.str.startswith("settled") | status_lower.str.startswith("scheduled to settle"))
+        & type_upper.str.startswith("UPI")
+        & (df[amount_col] > 0)
     )
     df = df[mask]
 
     records: list[dict] = []
     for _, row in df.iterrows():
         try:
-            date = pd.to_datetime(_clean(row["Creation time"])).date()
+            raw_time = _clean(row[time_col])
+            # Handle "1 Jul 2026, 11:02" as well as "2026-06-21 23:04:18"
+            date = pd.to_datetime(raw_time, dayfirst=True).date()
             records.append(
                 {
                     "shop": shop_name,
                     "merchant": "GPay",
                     "date": date,
-                    "amount": float(row["Amount"]),
-                    "payer": _clean(row.get("Payer/Receiver", "")),
-                    "txn_id": _clean(row.get("Transaction ID", "")),
+                    "amount": float(row[amount_col]),
+                    "payer": _clean(row[payer_col]) if payer_col else "",
+                    "txn_id": _clean(row[txn_col]) if txn_col else "",
                 }
             )
         except Exception as exc:
@@ -667,10 +707,20 @@ async def handle_document(update: Update,
         # Count rows that will pass the filter before storing
         df_tmp = df.copy()
         df_tmp.columns = [c.strip() for c in df_tmp.columns]
-        df_tmp["Amount"] = pd.to_numeric(df_tmp["Amount"], errors="coerce")
-        passable = int(((df_tmp["Status"].str.strip() == "Settled") &
-                        (df_tmp["Type"].str.strip() == "UPI") &
-                        (df_tmp["Amount"] > 0)).sum())
+        _amt_col  = _find_col(df_tmp, "amount")
+        _typ_col  = _find_col(df_tmp, "type")
+        _sta_col  = _find_col(df_tmp, "status")
+        if _amt_col and _typ_col and _sta_col:
+            df_tmp[_amt_col] = pd.to_numeric(df_tmp[_amt_col], errors="coerce")
+            _sta_l = df_tmp[_sta_col].str.strip().str.lower()
+            _typ_u = df_tmp[_typ_col].str.strip().str.upper()
+            passable = int(
+                (_sta_l.str.startswith("settled") | _sta_l.str.startswith("scheduled to settle"))
+                & _typ_u.str.startswith("UPI")
+                & (df_tmp[_amt_col] > 0)
+            ).sum()
+        else:
+            passable = "?"
 
         # Store raw bytes so state survives restarts
         bio.seek(0)
@@ -764,17 +814,24 @@ async def handle_text(update: Update,
         try:
             df_check = pd.read_csv(io.BytesIO(csv_bytes))
             df_check.columns = [c.strip() for c in df_check.columns]
-            df_check["Amount"] = pd.to_numeric(df_check["Amount"], errors="coerce")
-            settled = int((df_check["Status"].str.strip() == "Settled").sum())
-            upi     = int((df_check["Type"].str.strip() == "UPI").sum())
-            pos_amt = int((df_check["Amount"] > 0).sum())
-            detail  = f"Settled rows: {settled}  •  UPI rows: {upi}  •  Positive amount rows: {pos_amt}"
-        except Exception:
-            detail = "Could not inspect rows"
+            _a = _find_col(df_check, "amount")
+            _t = _find_col(df_check, "type")
+            _s = _find_col(df_check, "status")
+            if _a and _t and _s:
+                df_check[_a] = pd.to_numeric(df_check[_a], errors="coerce")
+                _sl = df_check[_s].str.strip().str.lower()
+                settled = int((_sl.str.startswith("settled") | _sl.str.startswith("scheduled to settle")).sum())
+                upi     = int(df_check[_t].str.strip().str.upper().str.startswith("UPI").sum())
+                pos_amt = int((df_check[_a] > 0).sum())
+                detail  = f"Settled/Scheduled rows: {settled}  •  UPI rows: {upi}  •  Positive amount rows: {pos_amt}"
+            else:
+                detail = f"Could not find expected columns. Found: {', '.join(df_check.columns[:6])}"
+        except Exception as exc:
+            detail = f"Could not inspect rows: {exc}"
         await update.message.reply_text(
             f"⚠️ No valid transactions kept from `{filename}` for *{shop_name}*\n"
             f"{detail}\n\n"
-            "Only *Settled + UPI + Amount > 0* rows are counted.\n"
+            "Counted rows must be: *UPI type + Settled (or Scheduled to Settle) + Amount > 0*\n"
             "Check that this is a GPay Business export.",
             parse_mode="Markdown",
         )
