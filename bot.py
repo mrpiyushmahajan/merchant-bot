@@ -542,8 +542,27 @@ def _reset_keyboard(n_records: int) -> InlineKeyboardMarkup:
     ]])
 
 
-async def _do_compile(message, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Generate and send the Excel report. `message` is any telegram Message object."""
+def _post_compile_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("📁 Keep data",           callback_data="keep_data"),
+        InlineKeyboardButton("🔄 Clear & start fresh", callback_data="reset_yes"),
+    ]])
+
+
+async def _disable_buttons(query) -> None:
+    """Remove the inline keyboard from the message that triggered this callback."""
+    try:
+        await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup([]))
+    except Exception:
+        pass   # message might be too old or already edited
+
+
+async def _do_compile(message, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """
+    Generate and send the Excel report.
+    Returns True on success, False on failure.
+    `message` is any telegram Message object.
+    """
     records = context.user_data["records"]
     msg     = await message.reply_text("⏳ Generating your Excel report…")
     try:
@@ -551,7 +570,7 @@ async def _do_compile(message, context: ContextTypes.DEFAULT_TYPE) -> None:
     except Exception as exc:
         logger.exception("Excel generation failed")
         await msg.edit_text(f"❌ Error generating report:\n`{exc}`", parse_mode="Markdown")
-        return
+        return False
 
     shops       = {f"{r['shop']} ({r['merchant']})" for r in records}
     grand_total = sum(r["amount"] for r in records)
@@ -572,6 +591,7 @@ async def _do_compile(message, context: ContextTypes.DEFAULT_TYPE) -> None:
         parse_mode="Markdown",
     )
     await msg.delete()
+    return True
 
 
 async def _prompt_next_gpay(message, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -587,7 +607,7 @@ async def _prompt_next_gpay(message, context: ContextTypes.DEFAULT_TYPE) -> None
         n = len(context.user_data["records"])
         await message.reply_text(
             f"✅ All files processed!  *{n}* transaction(s) collected.\n"
-            "Ready to generate the Excel report?",
+            "Send more files, or:",
             parse_mode="Markdown",
             reply_markup=_compile_prompt_keyboard(),
         )
@@ -727,7 +747,12 @@ async def cmd_compile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
         return
 
-    await _do_compile(update.message, context)
+    ok = await _do_compile(update.message, context)
+    if ok:
+        await update.message.reply_text(
+            "Keep the current data or start fresh for the next batch?",
+            reply_markup=_post_compile_keyboard(),
+        )
 
 
 async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -899,9 +924,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     _ensure_state(context)
     query = update.callback_query
-    await query.answer()   # dismiss the loading spinner on the button
+    await query.answer()          # dismiss the loading spinner on the button
+    await _disable_buttons(query) # remove buttons so they can't be tapped twice
     data  = query.data
-    msg   = query.message  # the message the buttons are attached to
+    msg   = query.message         # the message the buttons were attached to
 
     # ── Shop name button tapped ──
     if data.startswith("shop:"):
@@ -909,20 +935,23 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await _process_gpay_with_name(msg, context, shop_name)
         return
 
-    # ── "Type a new name" button — just acknowledge; text handler takes over ──
+    # ── "Type a new name" tapped — text handler will pick up what user types ──
     if data == "newshop":
-        await msg.reply_text(
-            "Type the shop name and send it:",
-        )
+        await msg.reply_text("✏️ Type the new shop name and send:")
         return
 
     # ── Compile now ──
     if data == "compile_now":
         records = context.user_data["records"]
         if not records:
-            await msg.reply_text("📭 Nothing to compile yet.")
+            await msg.reply_text("📭 Nothing to compile yet — send some CSVs first.")
             return
-        await _do_compile(msg, context)
+        ok = await _do_compile(msg, context)
+        if ok:
+            await msg.reply_text(
+                "Keep the current data or start fresh for the next batch?",
+                reply_markup=_post_compile_keyboard(),
+            )
         return
 
     # ── Wait for more files ──
@@ -933,14 +962,22 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
         return
 
-    # ── Reset confirmed ──
+    # ── Keep data after compile ──
+    if data == "keep_data":
+        n = len(context.user_data["records"])
+        await msg.reply_text(
+            f"📁 Data kept ({n} records).  Send more CSVs or /compile again anytime."
+        )
+        return
+
+    # ── Reset / clear confirmed (used by both /reset and post-compile prompt) ──
     if data == "reset_yes":
         context.user_data["records"]          = []
         context.user_data["pending_csv"]      = None
         context.user_data["gpay_queue"]       = []
         context.user_data["asking_gpay_name"] = False
         context.user_data["seen_txn_ids"]     = set()
-        # Keep known_shops — they're still useful after a reset
+        # Keep known_shops — shop names stay useful across sessions
         await msg.reply_text(
             "🔄 All records cleared!  Shop name history is kept.\n"
             "Send fresh CSVs whenever you're ready."
