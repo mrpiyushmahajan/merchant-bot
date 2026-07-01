@@ -9,7 +9,7 @@ Commands
 /start   – welcome & instructions
 /status  – show what has been collected so far
 /compile – generate and send the Excel report
-/reset   – clear all data for a fresh run
+/reset   – clear all data for a fresh run (asks confirmation)
 """
 
 import io
@@ -24,9 +24,10 @@ from dotenv import load_dotenv
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -89,15 +90,14 @@ def parse_gpay_csv(df: pd.DataFrame, shop_name: str) -> list[dict]:
     New layout : Type (UPI / UPI CC) | Payer | Creation time | Status | Amount
 
     Rules:
-    • Type    starts with 'UPI'          (filters out SoundPod / Daily collection rows)
-    • Status  is 'Settled' OR 'Scheduled to Settle'  (today's txns haven't settled yet)
-    • Amount  > 0                         (skip negative fee deductions)
+    • Type    starts with 'UPI'
+    • Status  is 'Settled' OR 'Scheduled to Settle'
+    • Amount  > 0
     """
     df = df.copy()
     df.columns = [c.strip() for c in df.columns]
 
-    # Locate columns flexibly
-    type_col   = _find_col(df, "type")           # "Type" or "Type (UPI / UPI CC)"
+    type_col   = _find_col(df, "type")
     status_col = _find_col(df, "status")
     amount_col = _find_col(df, "amount")
     time_col   = _find_col(df, "creation time")
@@ -105,15 +105,12 @@ def parse_gpay_csv(df: pd.DataFrame, shop_name: str) -> list[dict]:
     txn_col    = _find_col(df, "transaction id")
 
     if not all([type_col, status_col, amount_col, time_col]):
-        logger.warning(
-            "GPay CSV missing expected columns. Found: %s", list(df.columns)
-        )
+        logger.warning("GPay CSV missing expected columns. Found: %s", list(df.columns))
         return []
 
     df[amount_col] = pd.to_numeric(df[amount_col], errors="coerce")
-
-    status_lower = df[status_col].str.strip().str.lower()
-    type_upper   = df[type_col].str.strip().str.upper()
+    status_lower   = df[status_col].str.strip().str.lower()
+    type_upper     = df[type_col].str.strip().str.upper()
 
     mask = (
         (status_lower.str.startswith("settled") | status_lower.str.startswith("scheduled to settle"))
@@ -126,18 +123,15 @@ def parse_gpay_csv(df: pd.DataFrame, shop_name: str) -> list[dict]:
     for _, row in df.iterrows():
         try:
             raw_time = _clean(row[time_col])
-            # Handle "1 Jul 2026, 11:02" as well as "2026-06-21 23:04:18"
             date = pd.to_datetime(raw_time, dayfirst=True).date()
-            records.append(
-                {
-                    "shop": shop_name,
-                    "merchant": "GPay",
-                    "date": date,
-                    "amount": float(row[amount_col]),
-                    "payer": _clean(row[payer_col]) if payer_col else "",
-                    "txn_id": _clean(row[txn_col]) if txn_col else "",
-                }
-            )
+            records.append({
+                "shop":     shop_name,
+                "merchant": "GPay",
+                "date":     date,
+                "amount":   float(row[amount_col]),
+                "payer":    _clean(row[payer_col]) if payer_col else "",
+                "txn_id":   _clean(row[txn_col])   if txn_col   else "",
+            })
         except Exception as exc:
             logger.warning("Skipping GPay row – %s", exc)
 
@@ -146,20 +140,15 @@ def parse_gpay_csv(df: pd.DataFrame, shop_name: str) -> list[dict]:
 
 def parse_paytm_csv(df: pd.DataFrame) -> list[dict]:
     """
-    Paytm merchant export columns we care about:
-        Transaction_Date | Merchant_Name | Amount | Status
+    Paytm merchant export — reads Merchant_Name from the CSV.
 
     Rules:
     • Status == 'SUCCESS'
     • Amount >  0
-
-    Note: Paytm exports often wrap values in single quotes;
-    _clean() strips them.
     """
     df = df.copy()
     df.columns = [c.strip() for c in df.columns]
 
-    # Status may be wrapped in quotes
     df["_status"] = df["Status"].apply(_clean)
     df = df[df["_status"] == "SUCCESS"]
 
@@ -174,16 +163,14 @@ def parse_paytm_csv(df: pd.DataFrame) -> list[dict]:
         try:
             date = pd.to_datetime(_clean(row["Transaction_Date"])).date()
             shop = _clean(row.get("Merchant_Name", "Unknown"))
-            records.append(
-                {
-                    "shop": shop,
-                    "merchant": "Paytm",
-                    "date": date,
-                    "amount": float(row["Amount"]),
-                    "payer": _clean(row.get("Customer_VPA", "")),
-                    "txn_id": _clean(row.get("Transaction_ID", "")),
-                }
-            )
+            records.append({
+                "shop":     shop,
+                "merchant": "Paytm",
+                "date":     date,
+                "amount":   float(row["Amount"]),
+                "payer":    _clean(row.get("Customer_VPA", "")),
+                "txn_id":   _clean(row.get("Transaction_ID", "")),
+            })
         except Exception as exc:
             logger.warning("Skipping Paytm row – %s", exc)
 
@@ -194,17 +181,16 @@ def parse_paytm_csv(df: pd.DataFrame) -> list[dict]:
 #  EXCEL REPORT GENERATION
 # ══════════════════════════════════════════════════════════════════════════════
 
-# Colour palette
 C = {
-    "header_bg":      "263238",  # dark blue-grey  (column headers)
-    "title_bg":       "1A237E",  # deep indigo     (sheet title)
-    "gpay_row":       "E3F2FD",  # light blue      (GPay data rows)
-    "gpay_accent":    "1565C0",  # dark blue       (GPay label / font)
-    "paytm_row":      "E8F5E9",  # light green     (Paytm data rows)
-    "paytm_accent":   "2E7D32",  # dark green      (Paytm label / font)
-    "subtotal_bg":    "FFF9C4",  # light yellow    (per-shop subtotal)
-    "subtotal_font":  "E65100",  # deep orange     (subtotal label)
-    "grand_bg":       "BF360C",  # deep orange-red (grand total)
+    "header_bg":      "263238",
+    "title_bg":       "1A237E",
+    "gpay_row":       "E3F2FD",
+    "gpay_accent":    "1565C0",
+    "paytm_row":      "E8F5E9",
+    "paytm_accent":   "2E7D32",
+    "subtotal_bg":    "FFF9C4",
+    "subtotal_font":  "E65100",
+    "grand_bg":       "BF360C",
     "white":          "FFFFFF",
     "grey_border":    "B0BEC5",
 }
@@ -217,19 +203,16 @@ def _border(top=_thin, bottom=_thin, left=_thin, right=_thin):
     return Border(top=top, bottom=bottom, left=left, right=right)
 
 
-def _hdr(ws, row: int, col: int, value, bg: str = "header_bg",
-         fg: str = "white", size: int = 10, bold: bool = True,
-         h_align: str = "center") -> None:
+def _hdr(ws, row, col, value, bg="header_bg", fg="white", size=10,
+         bold=True, h_align="center"):
     cell = ws.cell(row=row, column=col, value=value)
     cell.font      = Font(bold=bold, color=C[fg], size=size, name="Calibri")
     cell.fill      = PatternFill("solid", fgColor=C[bg])
-    cell.alignment = Alignment(horizontal=h_align, vertical="center",
-                                wrap_text=True)
+    cell.alignment = Alignment(horizontal=h_align, vertical="center", wrap_text=True)
 
 
-def _data(ws, row: int, col: int, value, bg: str, bold: bool = False,
-          fmt: str | None = None, fg: str = "header_bg",
-          h_align: str = "center") -> None:
+def _data(ws, row, col, value, bg, bold=False, fmt=None, fg="header_bg",
+          h_align="center"):
     cell = ws.cell(row=row, column=col, value=value)
     cell.font      = Font(bold=bold, color=C[fg], name="Calibri", size=10)
     cell.fill      = PatternFill("solid", fgColor=C[bg])
@@ -238,23 +221,20 @@ def _data(ws, row: int, col: int, value, bg: str, bold: bool = False,
         cell.number_format = fmt
 
 
-def _set_widths(ws, widths: dict[str, float]) -> None:
+def _set_widths(ws, widths):
     for col_letter, w in widths.items():
         ws.column_dimensions[col_letter].width = w
 
 
-def _freeze(ws, cell: str) -> None:
+def _freeze(ws, cell):
     ws.freeze_panes = cell
 
 
-# ── Sheet helpers ──────────────────────────────────────────────────────────────
-
-def _build_dashboard(wb: Workbook, shop_daily: dict, shop_txns: dict) -> None:
+def _build_dashboard(wb, shop_daily, shop_txns):
     ws = wb.active
     ws.title = "Dashboard"
     ws.sheet_view.showGridLines = False
 
-    # Title
     ws.merge_cells("A1:F1")
     cell = ws["A1"]
     cell.value = (
@@ -266,7 +246,6 @@ def _build_dashboard(wb: Workbook, shop_daily: dict, shop_txns: dict) -> None:
     cell.alignment = Alignment(horizontal="left", vertical="center")
     ws.row_dimensions[1].height = 32
 
-    # Column headers
     col_labels = ["Shop Name", "Merchant", "Date", "Transactions", "Daily Turnover (₹)", ""]
     for c, lbl in enumerate(col_labels, 1):
         _hdr(ws, 2, c, lbl)
@@ -279,10 +258,9 @@ def _build_dashboard(wb: Workbook, shop_daily: dict, shop_txns: dict) -> None:
     row = 3
     grand_total = 0.0
 
-    for (shop, merchant), daily in sorted(shop_daily.items(),
-                                          key=lambda x: x[0][0]):
-        row_bg     = "gpay_row"    if merchant == "GPay"   else "paytm_row"
-        accent_key = "gpay_accent" if merchant == "GPay"   else "paytm_accent"
+    for (shop, merchant), daily in sorted(shop_daily.items(), key=lambda x: x[0][0]):
+        row_bg     = "gpay_row"    if merchant == "GPay" else "paytm_row"
+        accent_key = "gpay_accent" if merchant == "GPay" else "paytm_accent"
         accent_hex = C[accent_key]
 
         shop_total  = sum(daily.values())
@@ -291,56 +269,37 @@ def _build_dashboard(wb: Workbook, shop_daily: dict, shop_txns: dict) -> None:
         first_row   = row
 
         for date in sorted(daily.keys()):
-            day_txns = sum(
-                1 for r in shop_txns[(shop, merchant)] if r["date"] == date
-            )
+            day_txns = sum(1 for r in shop_txns[(shop, merchant)] if r["date"] == date)
             day_amt  = daily[date]
             is_first = (row == first_row)
 
-            # Shop name only in the first row of this group
-            name_cell = ws.cell(row=row, column=1,
-                                value=shop if is_first else "")
+            name_cell = ws.cell(row=row, column=1, value=shop if is_first else "")
             name_cell.fill      = PatternFill("solid", fgColor=C[row_bg])
-            name_cell.font      = Font(bold=is_first, color=accent_hex,
-                                       name="Calibri", size=10)
-            name_cell.alignment = Alignment(horizontal="left",
-                                             vertical="center",
-                                             indent=1)
+            name_cell.font      = Font(bold=is_first, color=accent_hex, name="Calibri", size=10)
+            name_cell.alignment = Alignment(horizontal="left", vertical="center", indent=1)
 
-            # Merchant
             mc = ws.cell(row=row, column=2, value=merchant if is_first else "")
             mc.fill      = PatternFill("solid", fgColor=C[row_bg])
-            mc.font      = Font(bold=True, color=accent_hex,
-                                 name="Calibri", size=10)
+            mc.font      = Font(bold=True, color=accent_hex, name="Calibri", size=10)
             mc.alignment = Alignment(horizontal="center", vertical="center")
 
-            _data(ws, row, 3, date.strftime("%d %b %Y"), row_bg,
-                  h_align="center")
+            _data(ws, row, 3, date.strftime("%d %b %Y"), row_bg, h_align="center")
             _data(ws, row, 4, day_txns,  row_bg, h_align="center")
-            _data(ws, row, 5, day_amt,   row_bg, fmt="#,##0.00",
-                  h_align="right")
+            _data(ws, row, 5, day_amt,   row_bg, fmt="#,##0.00", h_align="right")
 
             for c in range(1, 6):
                 ws.cell(row=row, column=c).border = _border()
             ws.row_dimensions[row].height = 18
             row += 1
 
-        # Per-shop subtotal
         ws.merge_cells(f"A{row}:B{row}")
-        sub = ws.cell(row=row, column=1,
-                      value=f"  {shop} — Subtotal")
-        sub.font      = Font(bold=True, color=C["subtotal_font"],
-                              name="Calibri", size=10)
+        sub = ws.cell(row=row, column=1, value=f"  {shop} — Subtotal")
+        sub.font      = Font(bold=True, color=C["subtotal_font"], name="Calibri", size=10)
         sub.fill      = PatternFill("solid", fgColor=C["subtotal_bg"])
-        sub.alignment = Alignment(horizontal="left", vertical="center",
-                                   indent=1)
-
+        sub.alignment = Alignment(horizontal="left", vertical="center", indent=1)
         _data(ws, row, 3, "", "subtotal_bg")
-        _data(ws, row, 4, txns_total, "subtotal_bg", bold=True,
-              fg="subtotal_font", h_align="center")
-        _data(ws, row, 5, shop_total, "subtotal_bg", bold=True,
-              fg="subtotal_font", fmt="#,##0.00", h_align="right")
-
+        _data(ws, row, 4, txns_total, "subtotal_bg", bold=True, fg="subtotal_font", h_align="center")
+        _data(ws, row, 5, shop_total, "subtotal_bg", bold=True, fg="subtotal_font", fmt="#,##0.00", h_align="right")
         for c in range(1, 6):
             ws.cell(row=row, column=c).border = _border(
                 top=Side(style="medium", color="E65100"),
@@ -349,24 +308,18 @@ def _build_dashboard(wb: Workbook, shop_daily: dict, shop_txns: dict) -> None:
         ws.row_dimensions[row].height = 20
         row += 1
 
-    # Grand total
     ws.merge_cells(f"A{row}:D{row}")
     gt = ws.cell(row=row, column=1, value="  GRAND TOTAL — All Shops")
     gt.font      = Font(bold=True, size=12, color=C["white"], name="Calibri")
     gt.fill      = PatternFill("solid", fgColor=C["grand_bg"])
     gt.alignment = Alignment(horizontal="left", vertical="center", indent=1)
-
     for c in range(2, 5):
-        ws.cell(row=row, column=c).fill = PatternFill("solid",
-                                                       fgColor=C["grand_bg"])
-
+        ws.cell(row=row, column=c).fill = PatternFill("solid", fgColor=C["grand_bg"])
     gv = ws.cell(row=row, column=5, value=grand_total)
-    gv.font           = Font(bold=True, size=12, color=C["white"],
-                              name="Calibri")
-    gv.fill           = PatternFill("solid", fgColor=C["grand_bg"])
-    gv.number_format  = "#,##0.00"
-    gv.alignment      = Alignment(horizontal="right", vertical="center")
-
+    gv.font          = Font(bold=True, size=12, color=C["white"], name="Calibri")
+    gv.fill          = PatternFill("solid", fgColor=C["grand_bg"])
+    gv.number_format = "#,##0.00"
+    gv.alignment     = Alignment(horizontal="right", vertical="center")
     for c in range(1, 6):
         ws.cell(row=row, column=c).border = _border(
             top=Side(style="thick", color="BF360C"),
@@ -378,7 +331,7 @@ def _build_dashboard(wb: Workbook, shop_daily: dict, shop_txns: dict) -> None:
     _freeze(ws, "A3")
 
 
-def _build_shop_summary(wb: Workbook, shop_daily: dict, shop_txns: dict) -> None:
+def _build_shop_summary(wb, shop_daily, shop_txns):
     ws = wb.create_sheet("Shop Summary")
     ws.sheet_view.showGridLines = False
 
@@ -398,11 +351,9 @@ def _build_shop_summary(wb: Workbook, shop_daily: dict, shop_txns: dict) -> None
 
     idx = 1
     grand = 0.0
-    for (shop, merchant), daily in sorted(shop_daily.items(),
-                                           key=lambda x: x[0][0]):
-        row_bg     = "gpay_row"    if merchant == "GPay"   else "paytm_row"
-        accent_key = "gpay_accent" if merchant == "GPay"   else "paytm_accent"
-
+    for (shop, merchant), daily in sorted(shop_daily.items(), key=lambda x: x[0][0]):
+        row_bg     = "gpay_row"    if merchant == "GPay" else "paytm_row"
+        accent_key = "gpay_accent" if merchant == "GPay" else "paytm_accent"
         total      = sum(daily.values())
         grand     += total
         txns       = len(shop_txns[(shop, merchant)])
@@ -410,15 +361,12 @@ def _build_shop_summary(wb: Workbook, shop_daily: dict, shop_txns: dict) -> None
         r          = idx + 2
 
         _data(ws, r, 1, idx,    row_bg, h_align="center")
-        _data(ws, r, 2, shop,   row_bg, bold=True, fg=accent_key,
-              h_align="left")
+        _data(ws, r, 2, shop,   row_bg, bold=True, fg=accent_key, h_align="left")
         _data(ws, r, 3, merchant, row_bg, bold=True, fg=accent_key)
         _data(ws, r, 4, txns,   row_bg, h_align="center")
-        _data(ws, r, 5, total,  row_bg, bold=True, fmt="#,##0.00",
-              h_align="right")
-        _data(ws, r, 6, dates[0].strftime("%d %b %Y"), row_bg)
+        _data(ws, r, 5, total,  row_bg, bold=True, fmt="#,##0.00", h_align="right")
+        _data(ws, r, 6, dates[0].strftime("%d %b %Y"),  row_bg)
         _data(ws, r, 7, dates[-1].strftime("%d %b %Y"), row_bg)
-
         for c in range(1, 8):
             ws.cell(row=r, column=c).border = _border()
         ws.row_dimensions[r].height = 20
@@ -431,18 +379,14 @@ def _build_shop_summary(wb: Workbook, shop_daily: dict, shop_txns: dict) -> None
     gt.fill      = PatternFill("solid", fgColor=C["grand_bg"])
     gt.alignment = Alignment(horizontal="left", vertical="center", indent=1)
     for c in range(2, 5):
-        ws.cell(row=gt_row, column=c).fill = PatternFill(
-            "solid", fgColor=C["grand_bg"])
-
+        ws.cell(row=gt_row, column=c).fill = PatternFill("solid", fgColor=C["grand_bg"])
     gv = ws.cell(row=gt_row, column=5, value=grand)
     gv.font          = Font(bold=True, size=12, color=C["white"], name="Calibri")
     gv.fill          = PatternFill("solid", fgColor=C["grand_bg"])
     gv.number_format = "#,##0.00"
     gv.alignment     = Alignment(horizontal="right", vertical="center")
-
     for c in range(6, 8):
-        ws.cell(row=gt_row, column=c).fill = PatternFill(
-            "solid", fgColor=C["grand_bg"])
+        ws.cell(row=gt_row, column=c).fill = PatternFill("solid", fgColor=C["grand_bg"])
     for c in range(1, 8):
         ws.cell(row=gt_row, column=c).border = _border(
             top=Side(style="thick", color="BF360C"),
@@ -450,12 +394,11 @@ def _build_shop_summary(wb: Workbook, shop_daily: dict, shop_txns: dict) -> None
         )
     ws.row_dimensions[gt_row].height = 26
 
-    _set_widths(ws, {"A": 5, "B": 24, "C": 12, "D": 20,
-                      "E": 22, "F": 14, "G": 14, "H": 4})
+    _set_widths(ws, {"A": 5, "B": 24, "C": 12, "D": 20, "E": 22, "F": 14, "G": 14, "H": 4})
     _freeze(ws, "A3")
 
 
-def _build_all_transactions(wb: Workbook, all_records: list[dict]) -> None:
+def _build_all_transactions(wb, all_records):
     ws = wb.create_sheet("All Transactions")
     ws.sheet_view.showGridLines = False
 
@@ -476,35 +419,27 @@ def _build_all_transactions(wb: Workbook, all_records: list[dict]) -> None:
     sorted_recs = sorted(all_records, key=lambda x: (x["shop"], x["date"]))
     for i, rec in enumerate(sorted_recs, 1):
         r          = i + 2
-        row_bg     = "gpay_row"    if rec["merchant"] == "GPay"   else "paytm_row"
-        accent_key = "gpay_accent" if rec["merchant"] == "GPay"   else "paytm_accent"
+        row_bg     = "gpay_row"    if rec["merchant"] == "GPay" else "paytm_row"
+        accent_key = "gpay_accent" if rec["merchant"] == "GPay" else "paytm_accent"
 
-        _data(ws, r, 1, i,                             row_bg, h_align="center")
-        _data(ws, r, 2, rec["shop"],                   row_bg, bold=True,
-              fg=accent_key, h_align="left")
-        _data(ws, r, 3, rec["merchant"],               row_bg, bold=True,
-              fg=accent_key)
+        _data(ws, r, 1, i,                              row_bg, h_align="center")
+        _data(ws, r, 2, rec["shop"],                    row_bg, bold=True, fg=accent_key, h_align="left")
+        _data(ws, r, 3, rec["merchant"],                row_bg, bold=True, fg=accent_key)
         _data(ws, r, 4, rec["date"].strftime("%d %b %Y"), row_bg)
-        _data(ws, r, 5, rec.get("payer", ""),          row_bg, h_align="left")
-        _data(ws, r, 6, rec.get("txn_id", ""),         row_bg, h_align="left")
-        _data(ws, r, 7, rec["amount"],                 row_bg,
-              fmt="#,##0.00", h_align="right")
-
+        _data(ws, r, 5, rec.get("payer", ""),           row_bg, h_align="left")
+        _data(ws, r, 6, rec.get("txn_id", ""),          row_bg, h_align="left")
+        _data(ws, r, 7, rec["amount"],                  row_bg, fmt="#,##0.00", h_align="right")
         for c in range(1, 8):
             ws.cell(row=r, column=c).border = _border()
         ws.row_dimensions[r].height = 17
 
-    # Auto-filter on header row
     ws.auto_filter.ref = f"A2:G{len(sorted_recs) + 2}"
-
-    _set_widths(ws, {"A": 5, "B": 24, "C": 12, "D": 16,
-                      "E": 30, "F": 36, "G": 16, "H": 4})
+    _set_widths(ws, {"A": 5, "B": 24, "C": 12, "D": 16, "E": 30, "F": 36, "G": 16, "H": 4})
     _freeze(ws, "A3")
 
 
 def generate_excel(all_records: list[dict]) -> bytes:
     """Build a 3-sheet workbook from all collected records and return bytes."""
-    # Pre-compute aggregations
     shop_daily: dict = defaultdict(lambda: defaultdict(float))
     shop_txns:  dict = defaultdict(list)
 
@@ -533,10 +468,10 @@ WELCOME = (
     "I compile *GPay Business* and *Paytm* merchant CSVs from multiple shops "
     "into a single, colour-coded Excel report.\n\n"
     "📤 *How to use*\n"
-    "1. Send all your CSV files at once (select multiple & send together)\n"
+    "1. Send your CSV files (one or many at once)\n"
     "2. Paytm CSVs are processed instantly — shop name is read automatically\n"
-    "3. For GPay CSVs I'll ask the shop name for each one\n"
-    "4. When done, use /compile to get the Excel report\n\n"
+    "3. For GPay CSVs, tap your shop name or type a new one\n"
+    "4. When done, tap *Compile now* or use /compile\n\n"
     "📋 *Commands*\n"
     "/status   — See what's collected so far\n"
     "/compile  — Generate & download the Excel report\n"
@@ -544,39 +479,200 @@ WELCOME = (
     "Go ahead — send your first CSV file! 📁"
 )
 
+MAX_KNOWN_SHOPS = 10   # how many shop names to remember
+
 
 def _ensure_state(context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data.setdefault("records",          [])
-    context.user_data.setdefault("pending_csv",      None)   # legacy – kept for compat
-    context.user_data.setdefault("gpay_queue",       [])     # list of (df, filename)
+    context.user_data.setdefault("pending_csv",      None)
+    context.user_data.setdefault("gpay_queue",       [])
     context.user_data.setdefault("asking_gpay_name", False)
+    context.user_data.setdefault("known_shops",      [])   # remembered shop names
+    context.user_data.setdefault("seen_txn_ids",     set()) # for duplicate detection
 
 
-async def _prompt_next_gpay(update: Update,
-                             context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Ask the user for the shop name of the next queued GPay CSV."""
+def _add_records(context: ContextTypes.DEFAULT_TYPE,
+                 new_records: list[dict]) -> tuple[list[dict], int]:
+    """
+    Add records to the session, skipping any whose txn_id was seen before.
+    Returns (list_of_added_records, skipped_count).
+    """
+    seen    = context.user_data["seen_txn_ids"]
+    added   = []
+    skipped = 0
+    for rec in new_records:
+        tid = rec.get("txn_id", "")
+        if tid and tid in seen:
+            skipped += 1
+        else:
+            if tid:
+                seen.add(tid)
+            context.user_data["records"].append(rec)
+            added.append(rec)
+    return added, skipped
+
+
+def _remember_shop(context: ContextTypes.DEFAULT_TYPE, shop_name: str) -> None:
+    """Add shop_name to the front of known_shops, capped at MAX_KNOWN_SHOPS."""
+    known = context.user_data["known_shops"]
+    if shop_name in known:
+        known.remove(shop_name)       # move to front
+    known.insert(0, shop_name)
+    del known[MAX_KNOWN_SHOPS:]       # keep list bounded
+
+
+def _shop_keyboard(known_shops: list[str]) -> InlineKeyboardMarkup:
+    """Inline keyboard: one button per known shop, plus a 'type new name' button."""
+    rows = [[InlineKeyboardButton(s, callback_data=f"shop:{s}")] for s in known_shops]
+    rows.append([InlineKeyboardButton("➕ Type a new name", callback_data="newshop")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _compile_prompt_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("📊 Compile now",         callback_data="compile_now"),
+        InlineKeyboardButton("⏳ Wait for more files", callback_data="wait_more"),
+    ]])
+
+
+def _reset_keyboard(n_records: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton(f"✅ Yes, clear {n_records} record(s)", callback_data="reset_yes"),
+        InlineKeyboardButton("❌ Cancel", callback_data="reset_no"),
+    ]])
+
+
+async def _do_compile(message, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Generate and send the Excel report. `message` is any telegram Message object."""
+    records = context.user_data["records"]
+    msg     = await message.reply_text("⏳ Generating your Excel report…")
+    try:
+        excel_bytes = generate_excel(records)
+    except Exception as exc:
+        logger.exception("Excel generation failed")
+        await msg.edit_text(f"❌ Error generating report:\n`{exc}`", parse_mode="Markdown")
+        return
+
+    shops       = {f"{r['shop']} ({r['merchant']})" for r in records}
+    grand_total = sum(r["amount"] for r in records)
+    fname       = f"Merchant_Report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+
+    bio      = io.BytesIO(excel_bytes)
+    bio.name = fname
+
+    await message.reply_document(
+        document=bio,
+        filename=fname,
+        caption=(
+            f"✅ *Report ready!*\n"
+            f"🏪 Shops: {len(shops)}\n"
+            f"📊 Transactions: {len(records)}\n"
+            f"💰 Grand Total: ₹{grand_total:,.2f}"
+        ),
+        parse_mode="Markdown",
+    )
+    await msg.delete()
+
+
+async def _prompt_next_gpay(message, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Ask the user for the shop name of the next queued GPay CSV.
+    When the queue is empty, show the compile-now / wait buttons.
+    `message` is any telegram Message object (from update.message or callback_query.message).
+    """
     queue = context.user_data["gpay_queue"]
+
     if not queue:
         context.user_data["asking_gpay_name"] = False
-        remaining = len(context.user_data["records"])
-        await update.message.reply_text(
-            f"✅ All files processed!  {remaining} transaction(s) collected.\n"
-            "Use /compile to generate the Excel report.",
+        n = len(context.user_data["records"])
+        await message.reply_text(
+            f"✅ All files processed!  *{n}* transaction(s) collected.\n"
+            "Ready to generate the Excel report?",
             parse_mode="Markdown",
+            reply_markup=_compile_prompt_keyboard(),
         )
         return
 
     _, filename = queue[0]
     context.user_data["asking_gpay_name"] = True
-    count = len(queue)
-    await update.message.reply_text(
+    count  = len(queue)
+    known  = context.user_data.get("known_shops", [])
+    plural = f"({count} GPay file(s) left)  " if count > 1 else ""
+
+    text = (
         f"📗 *GPay CSV:* `{filename}`\n"
-        f"{'(' + str(count) + ' GPay file(s) left to name)  ' if count > 1 else ''}"
-        f"What is the *shop name* for this file?\n"
-        "_(Just type the name and send)_",
-        parse_mode="Markdown",
+        f"{plural}What is the *shop name* for this file?"
     )
 
+    if known:
+        text += "\n_(Tap a name below or type a new one)_"
+        await message.reply_text(text, parse_mode="Markdown",
+                                 reply_markup=_shop_keyboard(known))
+    else:
+        text += "\n_(Type the shop name and send)_"
+        await message.reply_text(text, parse_mode="Markdown")
+
+
+async def _process_gpay_with_name(message, context: ContextTypes.DEFAULT_TYPE,
+                                   shop_name: str) -> None:
+    """
+    Pop the first GPay CSV from the queue, parse it with shop_name,
+    deduplicate, add records, then prompt for the next file (or compile).
+    """
+    queue = context.user_data["gpay_queue"]
+    if not queue:
+        context.user_data["asking_gpay_name"] = False
+        return
+
+    _remember_shop(context, shop_name)
+
+    csv_bytes, filename = queue.pop(0)
+    df          = pd.read_csv(io.BytesIO(csv_bytes))
+    new_records = parse_gpay_csv(df, shop_name)
+    added, skipped = _add_records(context, new_records)
+
+    if new_records:
+        added_total  = sum(r["amount"] for r in added)
+        skip_note    = f"\n⚠️ {skipped} duplicate txn(s) skipped" if skipped else ""
+        session_n    = len(context.user_data["records"])
+        await message.reply_text(
+            f"✅ *GPay processed:* `{filename}`\n"
+            f"🏪 Shop: `{shop_name}`  •  📊 {len(added)} txns  •  💰 ₹{added_total:,.2f}"
+            f"{skip_note}\n"
+            f"📦 Session total: {session_n} records",
+            parse_mode="Markdown",
+        )
+    else:
+        # Show diagnostic info
+        try:
+            df_check = pd.read_csv(io.BytesIO(csv_bytes))
+            df_check.columns = [c.strip() for c in df_check.columns]
+            _a = _find_col(df_check, "amount")
+            _t = _find_col(df_check, "type")
+            _s = _find_col(df_check, "status")
+            if _a and _t and _s:
+                df_check[_a] = pd.to_numeric(df_check[_a], errors="coerce")
+                _sl = df_check[_s].str.strip().str.lower()
+                settled = int((_sl.str.startswith("settled") | _sl.str.startswith("scheduled to settle")).sum())
+                upi     = int(df_check[_t].str.strip().str.upper().str.startswith("UPI").sum())
+                pos_amt = int((df_check[_a] > 0).sum())
+                detail  = f"Settled/Scheduled rows: {settled}  •  UPI rows: {upi}  •  Positive amount rows: {pos_amt}"
+            else:
+                detail = f"Unexpected columns: {', '.join(df_check.columns[:6])}"
+        except Exception as exc:
+            detail = f"Could not inspect: {exc}"
+        await message.reply_text(
+            f"⚠️ No valid transactions from `{filename}` for *{shop_name}*\n"
+            f"{detail}\n\n"
+            "Expected: UPI type + Settled (or Scheduled to Settle) + Amount > 0\n"
+            "Make sure this is a GPay Business export.",
+            parse_mode="Markdown",
+        )
+
+    await _prompt_next_gpay(message, context)
+
+
+# ── Command handlers ───────────────────────────────────────────────────────────
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     _ensure_state(context)
@@ -593,8 +689,8 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         )
         return
 
-    shop_totals: dict[str, float] = defaultdict(float)
-    shop_counts: dict[str, int]   = defaultdict(int)
+    shop_totals: dict = defaultdict(float)
+    shop_counts: dict = defaultdict(int)
     for r in records:
         key = f"{r['shop']}  ({r['merchant']})"
         shop_totals[key] += r["amount"]
@@ -604,8 +700,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     for key in sorted(shop_totals):
         lines.append(
             f"🏪 *{key}*\n"
-            f"   {shop_counts[key]} transactions  •  "
-            f"₹{shop_totals[key]:,.2f}"
+            f"   {shop_counts[key]} transactions  •  ₹{shop_totals[key]:,.2f}"
         )
     lines.append(
         f"\n💰 *Grand Total: ₹{sum(shop_totals.values()):,.2f}*\n\n"
@@ -619,9 +714,9 @@ async def cmd_compile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     records = context.user_data["records"]
 
     if context.user_data["gpay_queue"]:
-        remaining = len(context.user_data["gpay_queue"])
+        n = len(context.user_data["gpay_queue"])
         await update.message.reply_text(
-            f"⚠️ {remaining} GPay CSV(s) still need a shop name.\n"
+            f"⚠️ {n} GPay CSV(s) still need a shop name.\n"
             "Reply with the shop name to continue, then use /compile."
         )
         return
@@ -632,49 +727,56 @@ async def cmd_compile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
         return
 
-    msg = await update.message.reply_text("⏳ Generating your Excel report…")
-
-    try:
-        excel_bytes = generate_excel(records)
-    except Exception as exc:
-        logger.exception("Excel generation failed")
-        await msg.edit_text(f"❌ Error generating report:\n`{exc}`",
-                            parse_mode="Markdown")
-        return
-
-    shops       = {f"{r['shop']} ({r['merchant']})" for r in records}
-    grand_total = sum(r["amount"] for r in records)
-    fname       = f"Merchant_Report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
-
-    bio      = io.BytesIO(excel_bytes)
-    bio.name = fname
-
-    await update.message.reply_document(
-        document=bio,
-        filename=fname,
-        caption=(
-            f"✅ *Report ready!*\n"
-            f"🏪 Shops: {len(shops)}\n"
-            f"📊 Transactions: {len(records)}\n"
-            f"💰 Grand Total: ₹{grand_total:,.2f}"
-        ),
-        parse_mode="Markdown",
-    )
-    await msg.delete()
+    await _do_compile(update.message, context)
 
 
 async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    context.user_data["records"]          = []
-    context.user_data["pending_csv"]      = None
-    context.user_data["gpay_queue"]       = []
-    context.user_data["asking_gpay_name"] = False
+    _ensure_state(context)
+    n = len(context.user_data["records"])
+    if n == 0:
+        # Nothing to lose — just clear and confirm
+        context.user_data["records"]          = []
+        context.user_data["pending_csv"]      = None
+        context.user_data["gpay_queue"]       = []
+        context.user_data["asking_gpay_name"] = False
+        context.user_data["seen_txn_ids"]     = set()
+        await update.message.reply_text(
+            "🔄 Already empty!  Shop name history is kept.\n"
+            "Send CSVs whenever you're ready."
+        )
+        return
+
     await update.message.reply_text(
-        "🔄 All data cleared!  Send fresh CSVs whenever you're ready."
+        f"⚠️ This will clear *{n} transaction record(s)*.\n"
+        "Your shop name history will be kept.\n\nAre you sure?",
+        parse_mode="Markdown",
+        reply_markup=_reset_keyboard(n),
     )
 
 
-async def handle_document(update: Update,
-                           context: ContextTypes.DEFAULT_TYPE) -> None:
+async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Hidden command to inspect current session state."""
+    _ensure_state(context)
+    records    = context.user_data.get("records", [])
+    queue      = context.user_data.get("gpay_queue", [])
+    asking     = context.user_data.get("asking_gpay_name", False)
+    known      = context.user_data.get("known_shops", [])
+    seen_ids   = context.user_data.get("seen_txn_ids", set())
+    await update.message.reply_text(
+        f"🔍 *Debug state*\n"
+        f"Records collected: {len(records)}\n"
+        f"GPay queue length: {len(queue)}\n"
+        f"Waiting for name: {asking}\n"
+        f"Known shops: {known}\n"
+        f"Seen txn IDs: {len(seen_ids)}\n"
+        f"Shops in records: {sorted({r['shop'] for r in records}) if records else 'none'}",
+        parse_mode="Markdown",
+    )
+
+
+# ── Document & text handlers ───────────────────────────────────────────────────
+
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     _ensure_state(context)
     doc = update.message.document
 
@@ -685,7 +787,6 @@ async def handle_document(update: Update,
         )
         return
 
-    # Download & detect
     tg_file = await doc.get_file()
     bio     = io.BytesIO()
     await tg_file.download_to_memory(bio)
@@ -700,31 +801,28 @@ async def handle_document(update: Update,
         )
         return
 
-    csv_type = detect_csv_type(df)
-    cols_preview = ", ".join(list(df.columns)[:6])   # first 6 column names for debug
+    csv_type     = detect_csv_type(df)
+    cols_preview = ", ".join(list(df.columns)[:6])
 
     if csv_type == "gpay":
-        # Count rows that will pass the filter before storing
-        df_tmp = df.copy()
+        # Estimate how many rows will pass the filter (for display only)
+        df_tmp   = df.copy()
         df_tmp.columns = [c.strip() for c in df_tmp.columns]
-        _amt_col  = _find_col(df_tmp, "amount")
-        _typ_col  = _find_col(df_tmp, "type")
-        _sta_col  = _find_col(df_tmp, "status")
+        _amt_col = _find_col(df_tmp, "amount")
+        _typ_col = _find_col(df_tmp, "type")
+        _sta_col = _find_col(df_tmp, "status")
         if _amt_col and _typ_col and _sta_col:
             df_tmp[_amt_col] = pd.to_numeric(df_tmp[_amt_col], errors="coerce")
-            _sta_l = df_tmp[_sta_col].str.strip().str.lower()
-            _typ_u = df_tmp[_typ_col].str.strip().str.upper()
-            passable = int(
-                (
-                    (_sta_l.str.startswith("settled") | _sta_l.str.startswith("scheduled to settle"))
-                    & _typ_u.str.startswith("UPI")
-                    & (df_tmp[_amt_col] > 0)
-                ).sum()
-            )
+            _sta_l   = df_tmp[_sta_col].str.strip().str.lower()
+            _typ_u   = df_tmp[_typ_col].str.strip().str.upper()
+            passable = int((
+                (_sta_l.str.startswith("settled") | _sta_l.str.startswith("scheduled to settle"))
+                & _typ_u.str.startswith("UPI")
+                & (df_tmp[_amt_col] > 0)
+            ).sum())
         else:
             passable = "?"
 
-        # Store raw bytes so state survives restarts
         bio.seek(0)
         context.user_data["gpay_queue"].append((bio.read(), doc.file_name))
         await update.message.reply_text(
@@ -733,18 +831,17 @@ async def handle_document(update: Update,
             parse_mode="Markdown",
         )
         if not context.user_data["asking_gpay_name"]:
-            await _prompt_next_gpay(update, context)
+            await _prompt_next_gpay(update.message, context)
 
     elif csv_type == "paytm":
-        # Count before filtering
         df_tmp = df.copy()
         df_tmp.columns = [c.strip() for c in df_tmp.columns]
-        df_tmp["_s"] = df_tmp["Status"].apply(_clean)
-        total_rows  = len(df_tmp)
-        success_rows = int((df_tmp["_s"] == "SUCCESS").sum())
+        df_tmp["_s"]   = df_tmp["Status"].apply(_clean)
+        total_rows    = len(df_tmp)
+        success_rows  = int((df_tmp["_s"] == "SUCCESS").sum())
 
-        records = parse_paytm_csv(df)
-        if not records:
+        new_records = parse_paytm_csv(df)
+        if not new_records:
             await update.message.reply_text(
                 f"⚠️ *No records kept from* `{doc.file_name}`\n"
                 f"Total rows: {total_rows}  •  SUCCESS rows: {success_rows}\n\n"
@@ -755,14 +852,17 @@ async def handle_document(update: Update,
             )
             return
 
-        context.user_data["records"].extend(records)
-        shops = sorted({r["shop"] for r in records})
-        total = sum(r["amount"] for r in records)
+        added, skipped = _add_records(context, new_records)
+        shops     = sorted({r["shop"] for r in added})
+        total     = sum(r["amount"] for r in added)
+        skip_note = f"\n⚠️ {skipped} duplicate txn(s) skipped" if skipped else ""
+        session_n = len(context.user_data["records"])
         await update.message.reply_text(
             f"✅ *Paytm processed:* `{doc.file_name}`\n"
             f"🏪 Shop(s): `{'`, `'.join(shops)}`\n"
-            f"📊 {len(records)} transactions  •  💰 ₹{total:,.2f}\n"
-            f"📦 Session total so far: {len(context.user_data['records'])} records",
+            f"📊 {len(added)} transactions  •  💰 ₹{total:,.2f}"
+            f"{skip_note}\n"
+            f"📦 Session total so far: {session_n} records",
             parse_mode="Markdown",
         )
 
@@ -777,8 +877,7 @@ async def handle_document(update: Update,
         )
 
 
-async def handle_text(update: Update,
-                      context: ContextTypes.DEFAULT_TYPE) -> None:
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     _ensure_state(context)
 
     if not context.user_data["asking_gpay_name"]:
@@ -792,75 +891,73 @@ async def handle_text(update: Update,
         await update.message.reply_text("Please enter a valid shop name (can't be empty).")
         return
 
-    queue = context.user_data["gpay_queue"]
-    if not queue:
-        context.user_data["asking_gpay_name"] = False
+    await _process_gpay_with_name(update.message, context, shop_name)
+
+
+# ── Inline-button callback handler ────────────────────────────────────────────
+
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    _ensure_state(context)
+    query = update.callback_query
+    await query.answer()   # dismiss the loading spinner on the button
+    data  = query.data
+    msg   = query.message  # the message the buttons are attached to
+
+    # ── Shop name button tapped ──
+    if data.startswith("shop:"):
+        shop_name = data[5:]
+        await _process_gpay_with_name(msg, context, shop_name)
         return
 
-    # Process the first item in the queue (stored as raw bytes)
-    csv_bytes, filename = queue.pop(0)
-    df = pd.read_csv(io.BytesIO(csv_bytes))
-    records = parse_gpay_csv(df, shop_name)
-    context.user_data["records"].extend(records)
-
-    if records:
-        total = sum(r["amount"] for r in records)
-        await update.message.reply_text(
-            f"✅ *GPay processed:* `{filename}`\n"
-            f"🏪 Shop: `{shop_name}`  •  📊 {len(records)} txns  •  💰 ₹{total:,.2f}\n"
-            f"📦 Session total so far: {len(context.user_data['records'])} records",
-            parse_mode="Markdown",
+    # ── "Type a new name" button — just acknowledge; text handler takes over ──
+    if data == "newshop":
+        await msg.reply_text(
+            "Type the shop name and send it:",
         )
-    else:
-        # Show why no records were kept
-        try:
-            df_check = pd.read_csv(io.BytesIO(csv_bytes))
-            df_check.columns = [c.strip() for c in df_check.columns]
-            _a = _find_col(df_check, "amount")
-            _t = _find_col(df_check, "type")
-            _s = _find_col(df_check, "status")
-            if _a and _t and _s:
-                df_check[_a] = pd.to_numeric(df_check[_a], errors="coerce")
-                _sl = df_check[_s].str.strip().str.lower()
-                settled = int((_sl.str.startswith("settled") | _sl.str.startswith("scheduled to settle")).sum())
-                upi     = int(df_check[_t].str.strip().str.upper().str.startswith("UPI").sum())
-                pos_amt = int((df_check[_a] > 0).sum())
-                detail  = f"Settled/Scheduled rows: {settled}  •  UPI rows: {upi}  •  Positive amount rows: {pos_amt}"
-            else:
-                detail = f"Could not find expected columns. Found: {', '.join(df_check.columns[:6])}"
-        except Exception as exc:
-            detail = f"Could not inspect rows: {exc}"
-        await update.message.reply_text(
-            f"⚠️ No valid transactions kept from `{filename}` for *{shop_name}*\n"
-            f"{detail}\n\n"
-            "Counted rows must be: *UPI type + Settled (or Scheduled to Settle) + Amount > 0*\n"
-            "Check that this is a GPay Business export.",
-            parse_mode="Markdown",
-        )
+        return
 
-    # Ask for next GPay file's name, or finish
-    await _prompt_next_gpay(update, context)
+    # ── Compile now ──
+    if data == "compile_now":
+        records = context.user_data["records"]
+        if not records:
+            await msg.reply_text("📭 Nothing to compile yet.")
+            return
+        await _do_compile(msg, context)
+        return
+
+    # ── Wait for more files ──
+    if data == "wait_more":
+        await msg.reply_text(
+            "👍 Got it — send more CSVs whenever you're ready.\n"
+            "Use /compile when you want the report."
+        )
+        return
+
+    # ── Reset confirmed ──
+    if data == "reset_yes":
+        context.user_data["records"]          = []
+        context.user_data["pending_csv"]      = None
+        context.user_data["gpay_queue"]       = []
+        context.user_data["asking_gpay_name"] = False
+        context.user_data["seen_txn_ids"]     = set()
+        # Keep known_shops — they're still useful after a reset
+        await msg.reply_text(
+            "🔄 All records cleared!  Shop name history is kept.\n"
+            "Send fresh CSVs whenever you're ready."
+        )
+        return
+
+    # ── Reset cancelled ──
+    if data == "reset_no":
+        await msg.reply_text("↩️ Reset cancelled — your data is safe.")
+        return
+
+    logger.warning("Unknown callback data: %s", data)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  ENTRY POINT
 # ══════════════════════════════════════════════════════════════════════════════
-
-async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Hidden command to inspect current session state."""
-    _ensure_state(context)
-    records      = context.user_data.get("records", [])
-    gpay_queue   = context.user_data.get("gpay_queue", [])
-    asking       = context.user_data.get("asking_gpay_name", False)
-    await update.message.reply_text(
-        f"🔍 *Debug state*\n"
-        f"Records collected: {len(records)}\n"
-        f"GPay queue length: {len(gpay_queue)}\n"
-        f"Waiting for name: {asking}\n"
-        f"Shops in records: {sorted({r['shop'] for r in records}) if records else 'none'}",
-        parse_mode="Markdown",
-    )
-
 
 def main() -> None:
     if not BOT_TOKEN:
@@ -869,7 +966,6 @@ def main() -> None:
             "Copy .env.example → .env and add your token."
         )
 
-    # Persist user_data to disk so state survives Railway restarts & redeploys
     data_dir = Path(os.getenv("DATA_DIR", "data"))
     data_dir.mkdir(exist_ok=True)
     persistence = PicklePersistence(filepath=str(data_dir / "bot_state.pkl"))
@@ -887,6 +983,7 @@ def main() -> None:
     app.add_handler(CommandHandler("compile", cmd_compile))
     app.add_handler(CommandHandler("reset",   cmd_reset))
     app.add_handler(CommandHandler("debug",   cmd_debug))
+    app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
