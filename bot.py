@@ -715,10 +715,12 @@ async def handle_document(update: Update,
             _sta_l = df_tmp[_sta_col].str.strip().str.lower()
             _typ_u = df_tmp[_typ_col].str.strip().str.upper()
             passable = int(
-                (_sta_l.str.startswith("settled") | _sta_l.str.startswith("scheduled to settle"))
-                & _typ_u.str.startswith("UPI")
-                & (df_tmp[_amt_col] > 0)
-            ).sum()
+                (
+                    (_sta_l.str.startswith("settled") | _sta_l.str.startswith("scheduled to settle"))
+                    & _typ_u.str.startswith("UPI")
+                    & (df_tmp[_amt_col] > 0)
+                ).sum()
+            )
         else:
             passable = "?"
 
