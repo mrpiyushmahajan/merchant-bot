@@ -31,3 +31,7 @@ Thumbs.db
 
 # Sample output (not needed in repo)
 Sample_Report.xlsx
+
+# Bot persistence (state saved to disk)
+data/
+*.pkl

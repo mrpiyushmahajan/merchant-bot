@@ -17,6 +17,7 @@ import logging
 import os
 from collections import defaultdict
 from datetime import datetime
+from pathlib import Path
 
 import pandas as pd
 from dotenv import load_dotenv
@@ -29,6 +30,7 @@ from telegram.ext import (
     CommandHandler,
     ContextTypes,
     MessageHandler,
+    PicklePersistence,
     filters,
 )
 
@@ -661,8 +663,9 @@ async def handle_document(update: Update,
     csv_type = detect_csv_type(df)
 
     if csv_type == "gpay":
-        # Queue the GPay CSV; will ask for name after any in-progress name entry
-        context.user_data["gpay_queue"].append((df, doc.file_name))
+        # Store raw bytes (not DataFrame) so state survives bot restarts via pickle
+        bio.seek(0)
+        context.user_data["gpay_queue"].append((bio.read(), doc.file_name))
         await update.message.reply_text(
             f"📗 *GPay CSV queued:* `{doc.file_name}`",
             parse_mode="Markdown",
@@ -719,8 +722,9 @@ async def handle_text(update: Update,
         context.user_data["asking_gpay_name"] = False
         return
 
-    # Process the first item in the queue
-    df, filename = queue.pop(0)
+    # Process the first item in the queue (stored as raw bytes)
+    csv_bytes, filename = queue.pop(0)
+    df = pd.read_csv(io.BytesIO(csv_bytes))
     records = parse_gpay_csv(df, shop_name)
     context.user_data["records"].extend(records)
 
@@ -745,6 +749,22 @@ async def handle_text(update: Update,
 #  ENTRY POINT
 # ══════════════════════════════════════════════════════════════════════════════
 
+async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Hidden command to inspect current session state."""
+    _ensure_state(context)
+    records      = context.user_data.get("records", [])
+    gpay_queue   = context.user_data.get("gpay_queue", [])
+    asking       = context.user_data.get("asking_gpay_name", False)
+    await update.message.reply_text(
+        f"🔍 *Debug state*\n"
+        f"Records collected: {len(records)}\n"
+        f"GPay queue length: {len(gpay_queue)}\n"
+        f"Waiting for name: {asking}\n"
+        f"Shops in records: {sorted({r['shop'] for r in records}) if records else 'none'}",
+        parse_mode="Markdown",
+    )
+
+
 def main() -> None:
     if not BOT_TOKEN:
         raise RuntimeError(
@@ -752,13 +772,24 @@ def main() -> None:
             "Copy .env.example → .env and add your token."
         )
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    # Persist user_data to disk so state survives Railway restarts & redeploys
+    data_dir = Path(os.getenv("DATA_DIR", "data"))
+    data_dir.mkdir(exist_ok=True)
+    persistence = PicklePersistence(filepath=str(data_dir / "bot_state.pkl"))
+
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .persistence(persistence)
+        .build()
+    )
 
     app.add_handler(CommandHandler("start",   cmd_start))
     app.add_handler(CommandHandler("help",    cmd_start))
     app.add_handler(CommandHandler("status",  cmd_status))
     app.add_handler(CommandHandler("compile", cmd_compile))
     app.add_handler(CommandHandler("reset",   cmd_reset))
+    app.add_handler(CommandHandler("debug",   cmd_debug))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
