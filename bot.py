@@ -661,25 +661,45 @@ async def handle_document(update: Update,
         return
 
     csv_type = detect_csv_type(df)
+    cols_preview = ", ".join(list(df.columns)[:6])   # first 6 column names for debug
 
     if csv_type == "gpay":
-        # Store raw bytes (not DataFrame) so state survives bot restarts via pickle
+        # Count rows that will pass the filter before storing
+        df_tmp = df.copy()
+        df_tmp.columns = [c.strip() for c in df_tmp.columns]
+        df_tmp["Amount"] = pd.to_numeric(df_tmp["Amount"], errors="coerce")
+        passable = int(((df_tmp["Status"].str.strip() == "Settled") &
+                        (df_tmp["Type"].str.strip() == "UPI") &
+                        (df_tmp["Amount"] > 0)).sum())
+
+        # Store raw bytes so state survives restarts
         bio.seek(0)
         context.user_data["gpay_queue"].append((bio.read(), doc.file_name))
         await update.message.reply_text(
-            f"📗 *GPay CSV queued:* `{doc.file_name}`",
+            f"📗 *GPay CSV queued:* `{doc.file_name}`\n"
+            f"📋 {len(df)} rows total  •  ~{passable} will be counted after filtering",
             parse_mode="Markdown",
         )
-        # Start asking for names if not already doing so
         if not context.user_data["asking_gpay_name"]:
             await _prompt_next_gpay(update, context)
 
     elif csv_type == "paytm":
+        # Count before filtering
+        df_tmp = df.copy()
+        df_tmp.columns = [c.strip() for c in df_tmp.columns]
+        df_tmp["_s"] = df_tmp["Status"].apply(_clean)
+        total_rows  = len(df_tmp)
+        success_rows = int((df_tmp["_s"] == "SUCCESS").sum())
+
         records = parse_paytm_csv(df)
         if not records:
             await update.message.reply_text(
-                f"⚠️ No `SUCCESS` transactions found in `{doc.file_name}`.\n"
-                "Make sure you're using the correct merchant export."
+                f"⚠️ *No records kept from* `{doc.file_name}`\n"
+                f"Total rows: {total_rows}  •  SUCCESS rows: {success_rows}\n\n"
+                f"First columns seen: `{cols_preview}`\n\n"
+                "Expected Paytm columns: `Transaction_Date`, `Merchant_Name`, `Status`, `Amount`\n"
+                "Make sure this is the *merchant transaction export* from Paytm for Business.",
+                parse_mode="Markdown",
             )
             return
 
@@ -687,17 +707,20 @@ async def handle_document(update: Update,
         shops = sorted({r["shop"] for r in records})
         total = sum(r["amount"] for r in records)
         await update.message.reply_text(
-            f"✅ *Paytm CSV processed:* `{doc.file_name}`\n"
+            f"✅ *Paytm processed:* `{doc.file_name}`\n"
             f"🏪 Shop(s): `{'`, `'.join(shops)}`\n"
-            f"📊 Transactions: {len(records)}  •  💰 ₹{total:,.2f}",
+            f"📊 {len(records)} transactions  •  💰 ₹{total:,.2f}\n"
+            f"📦 Session total so far: {len(context.user_data['records'])} records",
             parse_mode="Markdown",
         )
 
     else:
         await update.message.reply_text(
-            f"❓ `{doc.file_name}` — couldn't identify as GPay or Paytm.\n\n"
-            "*GPay export* columns: `Creation time`, `Paid via`\n"
-            "*Paytm export* columns: `Transaction_Date`, `Merchant_Name`",
+            f"❓ *Could not identify:* `{doc.file_name}`\n\n"
+            f"Columns found: `{cols_preview}...`\n\n"
+            "*GPay export* must have: `Creation time`, `Paid via`\n"
+            "*Paytm export* must have: `Transaction_Date`, `Merchant_Name`\n\n"
+            "Make sure you export directly from the GPay Business / Paytm for Business app.",
             parse_mode="Markdown",
         )
 
@@ -732,12 +755,27 @@ async def handle_text(update: Update,
         total = sum(r["amount"] for r in records)
         await update.message.reply_text(
             f"✅ *GPay processed:* `{filename}`\n"
-            f"🏪 Shop: `{shop_name}`  •  📊 {len(records)} txns  •  💰 ₹{total:,.2f}",
+            f"🏪 Shop: `{shop_name}`  •  📊 {len(records)} txns  •  💰 ₹{total:,.2f}\n"
+            f"📦 Session total so far: {len(context.user_data['records'])} records",
             parse_mode="Markdown",
         )
     else:
+        # Show why no records were kept
+        try:
+            df_check = pd.read_csv(io.BytesIO(csv_bytes))
+            df_check.columns = [c.strip() for c in df_check.columns]
+            df_check["Amount"] = pd.to_numeric(df_check["Amount"], errors="coerce")
+            settled = int((df_check["Status"].str.strip() == "Settled").sum())
+            upi     = int((df_check["Type"].str.strip() == "UPI").sum())
+            pos_amt = int((df_check["Amount"] > 0).sum())
+            detail  = f"Settled rows: {settled}  •  UPI rows: {upi}  •  Positive amount rows: {pos_amt}"
+        except Exception:
+            detail = "Could not inspect rows"
         await update.message.reply_text(
-            f"⚠️ No valid UPI transactions found in `{filename}` for *{shop_name}*.",
+            f"⚠️ No valid transactions kept from `{filename}` for *{shop_name}*\n"
+            f"{detail}\n\n"
+            "Only *Settled + UPI + Amount > 0* rows are counted.\n"
+            "Check that this is a GPay Business export.",
             parse_mode="Markdown",
         )
 
